@@ -1,0 +1,98 @@
+﻿name: build-herdr-win-x64-single-b64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-x64:
+    name: Build herdr (win x64) + base64 single pack
+    runs-on: windows-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    env:
+      RUST_TOOLCHAIN_VERSION: 1.96.1
+
+    steps:
+      # herdr 仓库自带 scripts/package_windows_conpty.* 与 packaging/windows/conpty.json（Windows ConPTY bundle 必需）
+      - name: Checkout upstream herdrdev/herdr
+        uses: actions/checkout@v4
+        with:
+          repository: herdrdev/herdr
+          persist-credentials: false
+
+      - name: Rust toolchain 1.96.1 (win msvc target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-pc-windows-msvc
+
+      # herdr 内嵌 libghostty-vt（Zig 编译），官方固定 Zig 0.16.0
+      - name: Install Zig 0.16.0
+        uses: vercel-labs/setup-zig@v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Remove Zig caches (fresh)
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force .zig-cache -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force vendor/libghostty-vt/.zig-cache -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
+
+      - name: Cargo build herdr.exe
+        shell: pwsh
+        env:
+          LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+          LIBGHOSTTY_VT_SIMD: "true"
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      # Windows 产物 = herdr.exe + conpty/（conpty.dll + OpenConsole.exe），官方脚本从微软 ConPTY nupkg 打包并校验签名
+      - name: Package Windows ConPTY bundle (herdr-windows-x86_64.zip)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
+          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          .\scripts\package_windows_conpty.ps1 `
+            -HerdrExe target\x86_64-pc-windows-msvc\release\herdr.exe `
+            -PackagePath $package `
+            -StageDir $stage `
+            -OutputPath herdr-windows-x86_64.zip
+          Get-Item herdr-windows-x86_64.zip | Select-Object Name, Length
+
+      # 单文件：把官方 zip 直接 base64（zip 已是压缩包，无需再 tar.gz）
+      - name: Package & base64 single file (herdr.b64)
+        id: pkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Join-Path $PWD "herdr-windows-x86_64.zip"
+          test-path $zip | Out-Null
+          $b64 = Join-Path $PWD "herdr.b64"
+          $bytes = [IO.File]::ReadAllBytes($zip)
+          [IO.File]::WriteAllText($b64, [Convert]::ToBase64String($bytes), [Text.Encoding]::ASCII)
+          Get-Item $zip, $b64 | Select-Object Name, Length
+          Write-Output "b64=$b64" >> $env:GITHUB_OUTPUT
+
+      - name: Push single herdr.b64 to own GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: herdr-win-x64-${{ github.run_number }}
+          name: herdr win x64 build #${{ github.run_number }} (single b64)
+          body: |
+            从 herdrdev/herdr 自编译的 herdr（含 Windows ConPTY bundle），base64 单文件（不分片）。
+            还原：下载 herdr.b64 后
+            ```bash
+            base64 -d herdr.b64 > herdr-windows-x86_64.zip
+            # 解 zip 得 herdr.exe + conpty/（官方 Windows 包结构）
+            unzip herdr-windows-x86_64.zip
+            ```
+            PowerShell：
+            ```powershell
+            [IO.File]::WriteAllBytes('herdr-windows-x86_64.zip',[Convert]::FromBase64String((Get-Content herdr.b64 -Raw)))
+            Expand-Archive herdr-windows-x86_64.zip
+            ```
+          draft: false
+          prerelease: true
+          files: ${{ steps.pkg.outputs.b64 }}
