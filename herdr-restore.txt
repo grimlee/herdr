@@ -1,0 +1,6 @@
+还原 herdr.b64：
+  base64 -d herdr.b64 > herdr-windows-x86_64.zip
+  unzip herdr-windows-x86_64.zip     # 得到 herdr.exe + conpty/（官方 Windows 包结构）
+PowerShell:
+  [IO.File]::WriteAllBytes('herdr-windows-x86_64.zip',[Convert]::FromBase64String((Get-Content herdr.b64 -Raw)))
+  Expand-Archive herdr-windows-x86_64.zip
