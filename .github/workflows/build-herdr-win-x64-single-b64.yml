@@ -1,11 +1,11 @@
-﻿name: build-herdr-win-x64-single-b64
+name: build-herdr-win-x64-single-b64
 
 on:
   workflow_dispatch:
 
 jobs:
   build-windows-x64:
-    name: Build herdr (win x64) + base64 single pack
+    name: Build herdr (win x64) + base64 single pack -> dl branch
     runs-on: windows-latest
     timeout-minutes: 180
     permissions:
@@ -68,31 +68,47 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $zip = Join-Path $PWD "herdr-windows-x86_64.zip"
-          test-path $zip | Out-Null
           $b64 = Join-Path $PWD "herdr.b64"
           $bytes = [IO.File]::ReadAllBytes($zip)
           [IO.File]::WriteAllText($b64, [Convert]::ToBase64String($bytes), [Text.Encoding]::ASCII)
           Get-Item $zip, $b64 | Select-Object Name, Length
-          Write-Output "b64=$b64" >> $env:GITHUB_OUTPUT
+          # 还原说明（随单文件一起推到 dl 分支）——用逐行写，避免 here-string 缩进破坏 YAML
+          $restore = @(
+            "还原 herdr.b64：",
+            "  base64 -d herdr.b64 > herdr-windows-x86_64.zip",
+            "  unzip herdr-windows-x86_64.zip     # 得到 herdr.exe + conpty/（官方 Windows 包结构）",
+            "PowerShell:",
+            "  [IO.File]::WriteAllBytes('herdr-windows-x86_64.zip',[Convert]::FromBase64String((Get-Content herdr.b64 -Raw)))",
+            "  Expand-Archive herdr-windows-x86_64.zip"
+          )
+          Set-Content -Path (Join-Path $PWD "herdr-restore.txt") -Value $restore -Encoding utf8
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dist" | Out-Null
+          Copy-Item $b64, (Join-Path $PWD "herdr-restore.txt") "$env:GITHUB_WORKSPACE\dist\"
+          Get-ChildItem "$env:GITHUB_WORKSPACE\dist" | Select-Object Name, Length
+          Write-Output "dist=$env:GITHUB_WORKSPACE\dist" >> $env:GITHUB_OUTPUT
 
-      - name: Push single herdr.b64 to own GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload as backup artifact (safety net)
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: herdr-win-x64-${{ github.run_number }}
-          name: herdr win x64 build #${{ github.run_number }} (single b64)
-          body: |
-            从 herdrdev/herdr 自编译的 herdr（含 Windows ConPTY bundle），base64 单文件（不分片）。
-            还原：下载 herdr.b64 后
-            ```bash
-            base64 -d herdr.b64 > herdr-windows-x86_64.zip
-            # 解 zip 得 herdr.exe + conpty/（官方 Windows 包结构）
-            unzip herdr-windows-x86_64.zip
-            ```
-            PowerShell：
-            ```powershell
-            [IO.File]::WriteAllBytes('herdr-windows-x86_64.zip',[Convert]::FromBase64String((Get-Content herdr.b64 -Raw)))
-            Expand-Archive herdr-windows-x86_64.zip
-            ```
-          draft: false
-          prerelease: true
-          files: ${{ steps.pkg.outputs.b64 }}
+          name: herdr-win-x64-single-b64
+          path: ${{ steps.pkg.outputs.dist }}/*
+          if-no-files-found: error
+
+      - name: Push single b64 to dl branch
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location $env:GITHUB_WORKSPACE
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 以 orphan 方式重写 dl 分支，只保留本次单文件（每次构建覆盖旧版本）
+          git checkout --orphan dl
+          git rm -rf . 2>$null | Out-Null
+          Copy-Item dist\herdr.b64, dist\herdr-restore.txt . -Force
+          git add herdr.b64 herdr-restore.txt
+          git commit -m "herdr win x64 build #${{ github.run_number }} (single base64)" 2>$null | Out-Null
+          git remote set-url origin "https://x-access-token:${env:GITHUB_TOKEN}@github.com/${env:GITHUB_REPOSITORY}.git"
+          git push --force origin dl
+          Write-Output "Pushed dl branch: $((git ls-files).Count) files"
