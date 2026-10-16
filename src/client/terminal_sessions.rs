@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write as _};
+use std::sync::atomic::AtomicBool;
 
 use base64::Engine;
 use interprocess::local_socket::traits::Stream as _;
@@ -7,12 +8,12 @@ use tracing::info;
 
 use crate::ipc::LocalStream;
 use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, ClientMessage, RenderEncoding, ServerMessage,
-    MAX_GRAPHICS_FRAME_SIZE,
+    self, AttachScrollDirection, AttachScrollSource, ClientMessage, ClientMouseButton,
+    ClientMouseKind, ClientMousePosition, RenderEncoding, ServerMessage, MAX_GRAPHICS_FRAME_SIZE,
 };
 use crate::server::socket_paths::client_socket_path;
 
-use super::{do_handshake, init_logging, write_to_server, ClientError};
+use super::{do_handshake, init_logging, write_to_server, ClientError, HandshakePixelCapabilities};
 
 /// Runs a read-only terminal session observer and prints one JSON envelope per frame.
 pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io::Result<()> {
@@ -95,11 +96,16 @@ fn connect_terminal_session_stream(
         rows,
         0,
         0,
-        false,
+        HandshakePixelCapabilities {
+            exact_geometry: false,
+            sgr_mouse: false,
+        },
         None,
         false,
         false,
         true,
+        true,
+        &AtomicBool::new(false),
     ) {
         Ok(handshake) if handshake.encoding == RenderEncoding::TerminalAnsi => {}
         Ok(handshake) => {
@@ -186,8 +192,36 @@ enum TerminalControlCommand {
         #[serde(default)]
         modifiers: u8,
     },
+    #[serde(rename = "terminal.mouse")]
+    Mouse {
+        action: TerminalControlMouseAction,
+        #[serde(default)]
+        button: TerminalControlMouseButton,
+        column: u16,
+        row: u16,
+        #[serde(default)]
+        modifiers: u8,
+    },
     #[serde(rename = "terminal.release")]
     Release {},
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalControlMouseAction {
+    Down,
+    Up,
+    Drag,
+    Move,
+}
+
+#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalControlMouseButton {
+    #[default]
+    Left,
+    Right,
+    Middle,
 }
 
 #[derive(Clone, Copy, serde::Deserialize)]
@@ -270,6 +304,34 @@ pub(super) fn terminal_control_command_from_json(raw: &str) -> Result<ClientMess
                 column,
                 row,
                 modifiers,
+            })
+        }
+        TerminalControlCommand::Mouse {
+            action,
+            button,
+            column,
+            row,
+            modifiers,
+        } => {
+            let button = match button {
+                TerminalControlMouseButton::Left => ClientMouseButton::Left,
+                TerminalControlMouseButton::Right => ClientMouseButton::Right,
+                TerminalControlMouseButton::Middle => ClientMouseButton::Middle,
+            };
+            let kind = match action {
+                TerminalControlMouseAction::Down => ClientMouseKind::Down(button),
+                TerminalControlMouseAction::Up => ClientMouseKind::Up(button),
+                TerminalControlMouseAction::Drag => ClientMouseKind::Drag(button),
+                TerminalControlMouseAction::Move => ClientMouseKind::Moved,
+            };
+            // The server encodes the event for the pane's mouse mode and drops it
+            // when the application has not enabled mouse reporting.
+            Ok(ClientMessage::AttachMouse {
+                kind,
+                position: ClientMousePosition::Cell { column, row },
+                geometry: None,
+                modifiers,
+                lines: 1,
             })
         }
         TerminalControlCommand::Release {} => Ok(ClientMessage::Detach),

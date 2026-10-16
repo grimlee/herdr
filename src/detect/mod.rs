@@ -247,6 +247,13 @@ pub fn identify_agent(process_name: &str) -> Option<Agent> {
 }
 
 pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Agent, String)> {
+    identify_agent_process_in_job(job).map(|(agent, name, _)| (agent, name))
+}
+
+/// Like [`identify_agent_in_job`], plus the pid of the process that matched.
+pub fn identify_agent_process_in_job(
+    job: &crate::platform::ForegroundJob,
+) -> Option<(Agent, String, u32)> {
     if let Some(process) = job
         .processes
         .iter()
@@ -255,12 +262,12 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
         let candidate = normalized_process_name(process);
         if let Some(agent) = identify_agent(&candidate) {
             if agent != Agent::Letta || is_interactive_letta_process(process) {
-                return Some((agent, candidate));
+                return Some((agent, candidate, process.pid));
             }
         }
     }
 
-    let mut best: Option<(u8, Agent, String)> = None;
+    let mut best: Option<(u8, Agent, String, u32)> = None;
 
     for process in &job.processes {
         let candidate = normalized_process_name(process);
@@ -273,12 +280,12 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
         let score = process_priority(process, &candidate);
 
         match &best {
-            Some((best_score, _, _)) if *best_score >= score => {}
-            _ => best = Some((score, agent, candidate)),
+            Some((best_score, ..)) if *best_score >= score => {}
+            _ => best = Some((score, agent, candidate, process.pid)),
         }
     }
 
-    best.map(|(_, agent, name)| (agent, name))
+    best.map(|(_, agent, name, pid)| (agent, name, pid))
 }
 
 /// Detect the state of an agent from the live terminal tail snapshot.
@@ -366,6 +373,11 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     crate::platform::foreground_process_group_id(child_pid)
 }
 
+/// True when the pane's own shell is at its prompt with nothing running in it.
+pub fn pane_shell_is_idle(child_pid: u32) -> bool {
+    crate::platform::available_pane_shell(child_pid).is_some()
+}
+
 fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> String {
     let effective = process.argv0.as_deref().unwrap_or(&process.name);
     let lower_effective = effective.to_lowercase();
@@ -415,7 +427,8 @@ fn wrapped_agent_name_from_runtime_argv(runtime: &str, argv: Option<&[String]>) 
         "node" => cursor_agent_name_from_bundled_node_argv(argv)
             .or_else(|| script_arg_agent_name(argv, &["-e", "--eval", "-p", "--print"], &[])),
         "bun" => script_arg_agent_name(argv, &["-e", "--eval", "-p", "--print"], &[]),
-        name if is_python_runtime(name) => script_arg_agent_name(argv, &["-c"], &["-m"]),
+        name if is_python_runtime(name) => hermes_installer_agent_name(argv)
+            .or_else(|| script_arg_agent_name(argv, &["-c"], &["-m"])),
         "sh" | "bash" | "zsh" | "fish" => script_arg_agent_name(argv, &["-c"], &[]),
         "cmd" => windows_cmd_arg_agent_name(argv),
         "powershell" | "pwsh" => powershell_arg_agent_name(argv),
@@ -423,6 +436,61 @@ fn wrapped_agent_name_from_runtime_argv(runtime: &str, argv: Option<&[String]>) 
         _ => None,
     }
 }
+
+fn hermes_installer_agent_name(argv: &[String]) -> Option<String> {
+    let [_, isolation, command, code, args @ ..] = argv else {
+        return None;
+    };
+    if isolation != "-I"
+        || command != "-c"
+        || args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "--run-module" | "--print-runtime-command"))
+    {
+        return None;
+    }
+
+    // Recognize the captured installer bootstrap, not arbitrary Python source.
+    // Both root literals must agree; reject escapes or quotes rather than parse Python.
+    let rest = code.strip_prefix(HERMES_INSTALLER_PREFIX)?;
+    let (root, rest) = rest.split_once("')\n")?;
+    if root.is_empty() || root.contains(['\'', '\\', '\n', '\r']) {
+        return None;
+    }
+    let rest = rest
+        .strip_prefix(HERMES_INSTALLER_MIDDLE)?
+        .strip_prefix(root)?;
+    (rest == HERMES_INSTALLER_SUFFIX).then(|| agent_label(Agent::Hermes).to_string())
+}
+
+// Installer source captured in #4910. Only the installation root varies. Unknown
+// bootstrap revisions deliberately fall back to ordinary process identification.
+const HERMES_INSTALLER_PREFIX: &str = "import os, re, sys
+os.environ.pop('PYTHONHOME', None)
+os.environ.pop('PYTHONPATH', None)
+sys.path.insert(0, '";
+const HERMES_INSTALLER_MIDDLE: &str =
+    "if sys.argv[1:2] == ['--print-runtime-command']: sys.dont_write_bytecode = True
+from hermes_constants import get_default_hermes_root
+os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or str(get_default_hermes_root())
+if sys.argv[1:2] == ['--print-runtime-command']:
+    from pathlib import Path
+    from hermes_cli._launchers import print_runtime_command
+    print_runtime_command(Path('";
+const HERMES_INSTALLER_SUFFIX: &str = r"'), sys.argv[2:])
+    sys.exit(0)
+import hermes_bootstrap
+if sys.argv[1:2] == ['--run-module']:
+    import runpy
+    if len(sys.argv) < 3: sys.exit('hermes: --run-module needs a module')
+    module = sys.argv.pop(2)
+    del sys.argv[1]
+    runpy.run_module(module, run_name='__main__', alter_sys=True)
+    sys.exit(0)
+from hermes_cli.main import main
+sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+sys.exit(main())
+";
 
 fn cursor_agent_name_from_bundled_node_argv(argv: &[String]) -> Option<String> {
     let (runtime_parent, runtime_name) = path_parent_and_basename(argv.first()?)?;
@@ -1363,6 +1431,107 @@ mod tests {
         );
     }
 
+    fn hermes_installer_capture() -> crate::platform::ForegroundJob {
+        // Exact reporter capture from #4910; private path components were redacted.
+        let capture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/hermes-installer-process-info-4910.json"
+        ))
+        .unwrap();
+        let info = &capture["result"]["process_info"];
+        crate::platform::ForegroundJob {
+            process_group_id: info["foreground_process_group_id"].as_u64().unwrap() as u32,
+            processes: info["foreground_processes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|process| crate::platform::ForegroundProcess {
+                    pid: process["pid"].as_u64().unwrap() as u32,
+                    name: process["name"].as_str().unwrap().to_string(),
+                    argv0: Some(process["argv0"].as_str().unwrap().to_string()),
+                    argv: Some(serde_json::from_value(process["argv"].clone()).unwrap()),
+                    cmdline: Some(process["cmdline"].as_str().unwrap().to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_hermes_installer_capture() {
+        let mut job = hermes_installer_capture();
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Hermes, "hermes".to_string()))
+        );
+        // Pane probing also uses a leader-only fast path.
+        job.processes
+            .retain(|process| process.pid == job.process_group_id);
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Hermes, "hermes".to_string()))
+        );
+    }
+
+    #[test]
+    fn hermes_installer_signature_allows_another_install_root() {
+        let job = hermes_installer_capture();
+        let mut argv = job.processes.last().unwrap().argv.clone().unwrap();
+        argv[3] = argv[3].replace(
+            "/Users/REDACTED/.hermes/hermes-agent",
+            "/opt/another install/hermes-agent",
+        );
+        assert_eq!(hermes_installer_agent_name(&argv), Some("hermes".into()));
+    }
+
+    #[test]
+    fn identify_agent_in_job_rejects_hermes_installer_helper_modes() {
+        for mode in ["--run-module", "--print-runtime-command"] {
+            let mut job = hermes_installer_capture();
+            let argv = job.processes.last_mut().unwrap().argv.as_mut().unwrap();
+            argv.truncate(4);
+            argv.extend([mode.into(), "tui_gateway.entry".into()]);
+            assert_eq!(identify_agent_in_job(&job), None, "{mode}");
+        }
+    }
+
+    #[test]
+    fn hermes_installer_signature_rejects_incidental_source_and_unsafe_roots() {
+        let job = hermes_installer_capture();
+        let mut argv = job.processes.last().unwrap().argv.clone().unwrap();
+        let original = argv[3].clone();
+        for code in [
+            "print('hermes_cli.main')".to_string(),
+            format!("'''{original}'''"),
+            original.lines().map(|line| format!("# {line}\n")).collect(),
+            original.replace("/Users/REDACTED", "/Users/has'quote"),
+            original.replace("/Users/REDACTED", r"/Users/has\escape"),
+            original.replacen("/Users/REDACTED", "/different/root", 1),
+        ] {
+            argv[3] = code;
+            assert_eq!(hermes_installer_agent_name(&argv), None);
+        }
+    }
+
+    #[test]
+    fn identify_agent_in_job_rejects_hermes_source_outside_installer_invocation() {
+        for prefix in [
+            vec!["python3", "-m", "module"],
+            vec!["python3", "--", "script.py"],
+            vec!["python3", "script.py"],
+            vec!["bash", "-I"],
+        ] {
+            let mut job = hermes_installer_capture();
+            let process = job.processes.last_mut().unwrap();
+            let argv = process.argv.as_mut().unwrap();
+            let source = argv[3].clone();
+            *argv = prefix.iter().map(|arg| (*arg).to_string()).collect();
+            argv.extend(["-c".into(), source]);
+            process.name = prefix[0].into();
+            process.argv0 = Some(prefix[0].into());
+            process.cmdline = Some(argv.join(" "));
+            assert_eq!(identify_agent_in_job(&job), None, "{prefix:?}");
+        }
+    }
+
     #[test]
     fn identify_agent_in_job_detects_python_version_wrapped_hermes() {
         let job = crate::platform::ForegroundJob {
@@ -1492,6 +1661,9 @@ mod tests {
 
     #[test]
     fn identify_agent_in_job_detects_node_wrapped_pi_bundled_cli() {
+        // Hardened runtimes deny `PROCESS_VM_READ`, so the command line can come
+        // from a LimitedInformation query with the launcher path intact. The
+        // detection path must not depend on how that command line was obtained.
         let job = crate::platform::ForegroundJob {
             process_group_id: 123,
             processes: vec![foreground_process(
@@ -1924,6 +2096,55 @@ mod tests {
             identify_agent_in_job(&job),
             Some((Agent::Codex, "codex".to_string()))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pane_shell_is_idle_tracks_foreground_command() {
+        use portable_pty::CommandBuilder;
+        use std::io::Write;
+
+        fn wait_for(expected: bool, pid: u32) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if pane_shell_is_idle(pid) == expected {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        }
+
+        let pair = open_test_pty();
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-i");
+        cmd.env("ENV", "/dev/null");
+        let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn");
+        let pid = child.process_id().expect("no pid");
+        let mut reader = pair.master.try_clone_reader().expect("no reader");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while matches!(std::io::Read::read(&mut reader, &mut buf), Ok(n) if n > 0) {}
+        });
+        let mut writer = pair.master.take_writer().expect("no writer");
+
+        assert!(wait_for(true, pid), "interactive shell should start idle");
+        // End the foreground command with EOF rather than SIGINT. An interrupt
+        // sent while the shell is still moving the command into its own
+        // foreground process group can be delivered before the command resets
+        // its signal dispositions, leaving it running in a stale foreground
+        // group while the shell shows a prompt. `cat` blocks until stdin hits
+        // EOF, so it stays reliably busy until we end it.
+        writer.write_all(b"cat\n").unwrap();
+        assert!(wait_for(false, pid), "shell running a command is not idle");
+        writer.write_all(&[4]).unwrap();
+        assert!(
+            wait_for(true, pid),
+            "shell should be idle after the command ends"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
     }
 
     #[cfg(target_os = "linux")]

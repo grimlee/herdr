@@ -32,6 +32,89 @@ fn unavailable_terminal_grid_is_not_fabricated() {
 }
 
 #[test]
+fn resize_poll_loop_keeps_polling_through_a_transient_zero_grid() {
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel(8);
+    let should_quit = Arc::new(AtomicBool::new(false));
+    let quit = Arc::clone(&should_quit);
+    let mut samples = vec![
+        Err(crate::platform::zero_sized_terminal_grid_error()),
+        Ok((80u16, 24u16, 8u32, 16u32, true)),
+    ]
+    .into_iter();
+    let mut signals = vec![true, false].into_iter();
+
+    super::terminal_geometry::resize_poll_loop_with(
+        resize_tx,
+        (80, 24, 8, 16, true),
+        move |_| match samples.next() {
+            Some(sample) => sample,
+            None => {
+                quit.store(true, Ordering::Release);
+                Ok((80, 24, 8, 16, true))
+            }
+        },
+        move || signals.next().unwrap_or(false),
+        &should_quit,
+    );
+
+    // The transient zero-sized sample must keep the loop polling and retain the
+    // pending resize signal, so the recovered size re-reports exactly once even
+    // though it matches the last known size, and no failure is reported.
+    let mut events = Vec::new();
+    while let Ok(event) = resize_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        matches!(
+            events.as_slice(),
+            [super::ClientLoopEvent::Resize(80, 24, 8, 16, true)]
+        ),
+        "expected exactly one recovered resize report"
+    );
+}
+
+#[test]
+fn resize_poll_loop_detaches_once_on_a_real_terminal_failure() {
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel(8);
+    let should_quit = Arc::new(AtomicBool::new(false));
+    let mut samples = vec![
+        Err(crate::platform::zero_sized_terminal_grid_error()),
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "terminal is gone",
+        )),
+    ]
+    .into_iter();
+
+    super::terminal_geometry::resize_poll_loop_with(
+        resize_tx,
+        (80, 24, 8, 16, true),
+        move |_| {
+            samples
+                .next()
+                .expect("polling must stop after a real terminal failure")
+        },
+        || false,
+        &should_quit,
+    );
+
+    // The transient sample must not stop the loop, but the following real
+    // failure must report exactly one terminal-unavailable event and terminate.
+    let mut events = Vec::new();
+    while let Ok(event) = resize_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        matches!(
+            events.as_slice(),
+            [super::ClientLoopEvent::TerminalUnavailable(err)]
+                if err.kind() == io::ErrorKind::NotConnected
+        ),
+        "expected exactly one terminal-unavailable event"
+    );
+}
+
+#[test]
 fn missing_pixel_geometry_keeps_a_valid_terminal_grid() {
     let reported_cell_size = AtomicU64::new(0);
     let geometry = current_terminal_geometry_with(
@@ -67,6 +150,21 @@ fn direct_graphics_profile_is_narrow_and_transport_safe() {
     assert!(!direct_graphics_profile_values(
         "ghostty", "", false, false, false
     ));
+}
+
+#[test]
+fn server_graphics_files_require_local_filesystem_not_just_local_terminal() {
+    let local = endpoint::ClientEndpointId::Local;
+    let ssh = endpoint::ClientEndpointId::Ssh(
+        endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+    );
+    // Keep old local peers working without requiring a negotiated capability.
+    assert!(server_graphics_files_allowed(&local, false));
+    // Saved SSH endpoints run in the normal local client process.
+    assert!(!server_graphics_files_allowed(&ssh, false));
+    // A standalone --remote bridge can retain the Local endpoint identity.
+    assert!(!server_graphics_files_allowed(&local, true));
+    assert!(!server_graphics_files_allowed(&ssh, true));
 }
 
 fn restore_env_var(key: &str, value: Option<OsString>) {
@@ -421,11 +519,6 @@ fn color_scheme_change_event_requests_host_theme_query() {
     assert!(crate::raw_input::events_require_host_terminal_theme_query(
         &events
     ));
-}
-
-#[test]
-fn host_terminal_theme_query_is_disabled_on_windows() {
-    assert_eq!(should_query_host_terminal_theme(), !cfg!(windows));
 }
 
 #[test]
@@ -872,6 +965,67 @@ fn terminal_control_resize_command_maps_to_client_resize() {
 }
 
 #[test]
+fn terminal_control_mouse_command_maps_to_attach_mouse() {
+    let action = terminal_control_command_from_json(
+        r#"{"type":"terminal.mouse","action":"down","column":12,"row":5}"#,
+    )
+    .unwrap();
+    let ClientMessage::AttachMouse {
+        kind,
+        position,
+        geometry,
+        modifiers,
+        lines,
+    } = action
+    else {
+        panic!("expected attach mouse command");
+    };
+    assert_eq!(
+        kind,
+        crate::protocol::ClientMouseKind::Down(crate::protocol::ClientMouseButton::Left)
+    );
+    assert_eq!(
+        position,
+        crate::protocol::ClientMousePosition::Cell { column: 12, row: 5 }
+    );
+    assert_eq!((geometry, modifiers, lines), (None, 0, 1));
+}
+
+#[test]
+fn terminal_control_mouse_command_maps_every_action_and_button() {
+    use crate::protocol::{ClientMouseButton as Button, ClientMouseKind as Kind};
+    for (json, expected) in [
+        (r#""action":"up","button":"right""#, Kind::Up(Button::Right)),
+        (
+            r#""action":"drag","button":"middle""#,
+            Kind::Drag(Button::Middle),
+        ),
+        (r#""action":"move""#, Kind::Moved),
+    ] {
+        let raw = format!(r#"{{"type":"terminal.mouse",{json},"column":0,"row":0,"modifiers":4}}"#);
+        let ClientMessage::AttachMouse {
+            kind, modifiers, ..
+        } = terminal_control_command_from_json(&raw).unwrap()
+        else {
+            panic!("expected attach mouse command");
+        };
+        assert_eq!((kind, modifiers), (expected, 4), "{raw}");
+    }
+}
+
+#[test]
+fn terminal_control_mouse_command_rejects_unknown_actions_and_missing_cells() {
+    assert!(terminal_control_command_from_json(
+        r#"{"type":"terminal.mouse","action":"click","column":1,"row":1}"#
+    )
+    .is_err());
+    assert!(terminal_control_command_from_json(
+        r#"{"type":"terminal.mouse","action":"down","column":1}"#
+    )
+    .is_err());
+}
+
+#[test]
 fn terminal_control_scroll_command_maps_to_attach_scroll() {
     let action = terminal_control_command_from_json(
         r#"{"type":"terminal.scroll","direction":"up","lines":3}"#,
@@ -889,12 +1043,4 @@ fn terminal_control_scroll_command_maps_to_attach_scroll() {
     assert_eq!(source, AttachScrollSource::Wheel);
     assert_eq!(direction, AttachScrollDirection::Up);
     assert_eq!(lines, 3);
-}
-
-#[test]
-fn forward_clipboard_uses_local_clipboard_path() {
-    let _guard = env_lock().lock().unwrap();
-    let _ssh = EnvVarGuard::set("SSH_CONNECTION", "1 2 3 4");
-    assert!(forward_clipboard("dGVzdA=="));
-    assert!(!forward_clipboard("not base64"));
 }

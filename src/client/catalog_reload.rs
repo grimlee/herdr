@@ -47,7 +47,7 @@ pub(super) fn apply_profiles(
         endpoints.disconnect(&endpoint_id);
         let cancelled = commands.disconnect(&endpoint_id);
         #[cfg(unix)]
-        state.retire_endpoint_graphics(&endpoint_id);
+        state.forget_endpoint_graphics(&endpoint_id);
         if let Some(shell) = state.shell.as_mut() {
             for request_id in cancelled {
                 shell.cancel_endpoint_request(&request_id);
@@ -71,6 +71,7 @@ pub(super) fn apply_profiles(
     }) {
         catalog.select_local();
     }
+    let pixel_mouse_available = state.pixel_mouse_available();
     if let Some(shell) = state.shell.as_mut() {
         shell.set_endpoint_catalog(&catalog.ssh);
         if endpoints.active_surface_available()
@@ -84,7 +85,7 @@ pub(super) fn apply_profiles(
                 state.reported_size.1,
                 state.reported_cell_size.0,
                 state.reported_cell_size.1,
-                state.pixel_geometry_exact,
+                pixel_mouse_available,
             ));
         }
     }

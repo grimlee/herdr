@@ -1,13 +1,17 @@
 use super::*;
 
-#[path = "pane_graphics.rs"]
-mod pane_graphics_tests;
+mod event_fairness;
+mod native_graphics;
 #[path = "pane_move.rs"]
 mod pane_move_tests;
+#[path = "pane_graphics.rs"]
+mod retained_graphics_tests;
 #[path = "surface_delta.rs"]
 mod surface_delta_tests;
 #[path = "surface_interest.rs"]
 mod surface_interest_tests;
+#[path = "surface_scroll.rs"]
+mod surface_scroll_tests;
 
 fn client_shell_projection(
     receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
@@ -86,9 +90,11 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         .set_nonblocking(ListenerNonblockingMode::Accept)
         .expect("set listener nonblocking");
     let (server_event_tx, server_event_rx) = mpsc::channel(64);
-    let should_quit = Arc::new(AtomicBool::new(false));
+    let server_stop = ServerStop::default();
+    let should_quit = server_stop.flag().clone();
     #[cfg(windows)]
-    spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
+    spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone())
+        .expect("spawn client accept thread");
     let server_keybindings = app_keybindings(&app);
     let headless_size = app.state.headless_size;
 
@@ -102,6 +108,9 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         client_socket_path: socket_path,
         client_socket_identity,
         clients: HashMap::new(),
+        native_graphics: Default::default(),
+        interactive_input_deadlines: HashMap::new(),
+        interactive_render_budget: None,
         #[cfg(unix)]
         next_client_id: 1,
         foreground_client_id: None,
@@ -121,10 +130,13 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         effective_size: headless_size,
         shutting_down: false,
         host_shutdown_requested: Arc::new(AtomicBool::new(false)),
+        host_shutdown_intent: Default::default(),
+        host_shutdown_probe: crate::platform::host_shutdown_in_progress,
         handoff_in_progress: false,
         #[cfg(unix)]
         pending_handoff_repaint_nudge: false,
         should_quit,
+        server_stop,
         server_event_rx,
         server_event_tx,
     }
@@ -245,7 +257,6 @@ fn headless_pane_list(server: &mut HeadlessServer) -> Vec<api::schema::PaneInfo>
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     let response: api::schema::SuccessResponse =
         serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
@@ -303,7 +314,6 @@ fn headless_api_request_drains_all_pending_internal_events_before_reading_state(
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         })
     );
     let response = response_rx
@@ -718,6 +728,7 @@ async fn client_shell_attach_seeds_workspace() {
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id: 6,
             surface_cols: 80,
             surface_rows: 23,
@@ -760,6 +771,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
         surface_active: false,
         surface_reuse: false,
         surface_delta: false,
+        surface_scroll: false,
         writer,
     });
     let (_, initial) = client_shell_projection(&control_rx);
@@ -808,6 +820,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id,
             surface_cols: 80,
             surface_rows: 23,
@@ -926,6 +939,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id: 77,
             surface_cols: 80,
             surface_rows: 23,
@@ -1028,6 +1042,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id: 7,
             surface_cols: 80,
             surface_rows: 23,
@@ -1195,6 +1210,7 @@ fn connect_test_shell(
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id,
             surface_cols,
             surface_rows,
@@ -1799,6 +1815,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id: 13,
             surface_cols: 80,
             surface_rows: 23,
@@ -1823,6 +1840,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id: 14,
             surface_cols: 80,
             surface_rows: 23,
@@ -2100,7 +2118,6 @@ async fn client_local_navigation_does_not_emit_global_focus_transitions() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         },
     );
     server.app.sync_focus_events();
@@ -2191,7 +2208,6 @@ async fn client_local_navigation_emits_pane_focused_only_when_that_client_moves(
                 },
                 respond_to,
                 response_write_complete: None,
-                stream_active: None,
             },
         );
         let response = response_rx.recv().expect("navigation response");
@@ -2323,7 +2339,6 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         },
     ));
 
@@ -2368,7 +2383,6 @@ async fn public_close_reapplies_controller_geometry() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         })
     );
 
@@ -2572,7 +2586,6 @@ async fn public_background_tab_create_preserves_client_locations() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert_eq!(
@@ -2620,7 +2633,6 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     let first_location = server.clients[&41].shell_location.as_ref().unwrap();
@@ -2701,7 +2713,6 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     let response: crate::api::schema::SuccessResponse =
         serde_json::from_str(&response_rx.recv().expect("agent focus response")).unwrap();
@@ -2749,6 +2760,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id: 9,
             surface_cols: 80,
             surface_rows: 23,
@@ -2776,7 +2788,6 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     assert_eq!(server.app.state.active, Some(1));
     server.render_and_stream();
@@ -2996,6 +3007,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id: 12,
             surface_cols: 80,
             surface_rows: 23,
@@ -3393,7 +3405,6 @@ async fn worktree_discovery_does_not_block_client_typing() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         });
         entered
             .recv_timeout(Duration::from_secs(5))
@@ -3642,6 +3653,145 @@ async fn client_shell_mouse_motion_delivers_without_render_when_foreground() {
         input_rx.try_recv().is_ok(),
         "motion must still reach the PTY"
     );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn client_shell_split_echo_bypasses_cadence_with_bounded_visible_burst() {
+    let mut server = test_headless_server();
+    let mut input_rx = install_focused_test_runtime(&mut server, b"PS> old");
+    let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let (_control_rx, render_rx) = connect_matching_test_shell(&mut server, 1);
+    server.render_and_stream();
+    recv_pane_surface(&render_rx, "initial prompt");
+    server.sync_immediate_pty_sources();
+    server.app.render_dirty.take();
+
+    assert_eq!(
+        server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+            client_id: 1,
+            pane_id: public_pane_id,
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "Z".into()
+            )],
+        }),
+        RenderImpact::None
+    );
+    assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"Z"));
+    assert!(server.interactive_input_deadlines.contains_key(&pane_id));
+
+    // A full queue after an accepted key must not lose that key's priority.
+    for _ in 0..3 {
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .unwrap();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"queued"))
+            .unwrap();
+    }
+    server.interactive_input_deadlines.clear();
+    server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+        client_id: 1,
+        pane_id: server.app.public_pane_id(0, pane_id).unwrap(),
+        events: vec![
+            crate::protocol::ClientPaneInputEvent::TextCommit("A".into()),
+            crate::protocol::ClientPaneInputEvent::TextCommit("B".into()),
+        ],
+    });
+    for _ in 0..3 {
+        assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"queued"));
+    }
+    assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"A"));
+    assert!(input_rx.try_recv().is_err());
+    assert!(server.interactive_input_deadlines.contains_key(&pane_id));
+
+    let start = Instant::now();
+    server.note_interactive_input(pane_id, start);
+    server.app.record_render_attempt(start, true);
+    // Escape-only PTY updates must not use the whole allowance before the glyph.
+    for index in 0..12 {
+        let now = start + Duration::from_micros(index * 50 + 50);
+        write_shared_test_pane(&mut server, pane_id, b"\x1b[0m");
+        server.app.render_dirty.request_pty(pane_id);
+        assert!(server.can_render_interactive(now));
+        let request = server.app.render_dirty.take();
+        assert!(server.render_retained_pane_surface_and_stream(&request.pty_sources));
+        while let Ok(message) = render_rx.try_recv() {
+            let ServerMessage::PaneSurfacePatch(patch) = read_server_message(message) else {
+                panic!("expected retained patch for escape-only update");
+            };
+            assert!(patch.rows.is_empty());
+        }
+        server.app.record_render_attempt(now, true);
+        server.record_interactive_render(now);
+    }
+    for (index, bytes) in [b"\rPS>    \rPS> ".as_slice(), b"Z", b"\r\n", b"PS> "]
+        .into_iter()
+        .enumerate()
+    {
+        let now = start + Duration::from_millis(index as u64 + 1);
+        write_shared_test_pane(&mut server, pane_id, bytes);
+        server.app.render_dirty.request_pty(pane_id);
+        assert!(!server.app.can_render_now(now));
+        assert!(!server.app.can_present_now(now));
+        assert!(server.can_render_interactive(now));
+        let request = server.app.render_dirty.take();
+        assert!(server.render_retained_pane_surface_and_stream(&request.pty_sources));
+        recv_pane_surface_patch(&render_rx, "split prompt update");
+        if index == 1 {
+            assert!(frame_text(
+                &server.clients[&1]
+                    .render_state
+                    .last_pane_surface()
+                    .unwrap()
+                    .frame
+            )
+            .contains("PS> Z"));
+        }
+        server.app.record_render_attempt(now, true);
+        server.record_interactive_render(now);
+    }
+
+    let busy = start + Duration::from_millis(5);
+    // Repeated keys cannot replenish the output budget within its epoch.
+    server.note_interactive_input(pane_id, busy);
+    server.app.render_dirty.request_pty(pane_id);
+    assert!(!server.can_render_interactive(busy));
+    assert!(!server.app.can_render_now(busy));
+    let next_render = server
+        .app
+        .next_headless_loop_deadline_with_git_refresh(busy, true, false)
+        .unwrap();
+    assert!(server.app.can_render_now(next_render));
+
+    let next_epoch = start + Duration::from_millis(17);
+    assert!(server.can_render_interactive(next_epoch));
+    server.app.render_dirty.take();
+    let unrelated = crate::layout::PaneId::from_raw(pane_id.raw() + 1000);
+    server
+        .app
+        .render_dirty
+        .set_immediate_pty_sources(HashSet::from([pane_id, unrelated]));
+    server.app.render_dirty.request_pty(unrelated);
+    assert!(!server.can_render_interactive(next_epoch));
+    server.app.render_dirty.request_pty(pane_id);
+    server
+        .app
+        .render_dirty
+        .set_immediate_pty_sources(HashSet::from([unrelated]));
+    assert!(
+        !server.can_render_interactive(next_epoch),
+        "hidden input target stays coalesced"
+    );
+    server
+        .app
+        .render_dirty
+        .set_immediate_pty_sources(HashSet::from([pane_id]));
+    assert!(server.can_render_interactive(start + Duration::from_millis(33)));
+    assert!(!server.can_render_interactive(start + Duration::from_millis(38)));
     shutdown_test_runtimes(&mut server);
 }
 
@@ -4655,6 +4805,38 @@ fn unchanged_git_refresh_does_not_request_headless_render() {
 }
 
 #[test]
+fn failed_startup_git_refresh_retries_without_clients() {
+    let mut server = test_headless_server();
+    server
+        .app
+        .state
+        .workspaces
+        .push(crate::workspace::Workspace::test_new("restored"));
+    assert_eq!(server.app_client_count(), 0);
+
+    crate::thread_spawn::test_hook::fail_next_spawns(1);
+    server.app.refresh_restored_workspace_git_metadata();
+    assert!(!server.app.git_refresh_in_flight);
+
+    let now = Instant::now();
+    let retry_at = server
+        .app
+        .next_headless_loop_deadline_with_git_refresh(now, false, server.git_refresh_scheduled())
+        .expect("failed startup refresh schedules a retry");
+    assert_eq!(Some(retry_at), server.app.git_refresh_deadline());
+
+    server.handle_scheduled_tasks_headless(retry_at, false);
+    assert!(server.app.git_refresh_in_flight);
+    assert!(!server.app.git_identity_refresh_requested);
+
+    // Once the retry starts, clientless servers stop polling again.
+    server.app.git_refresh_in_flight = false;
+    server.app.request_git_identity_refresh(retry_at);
+    server.handle_scheduled_tasks_headless(retry_at, false);
+    assert!(!server.app.git_refresh_in_flight);
+}
+
+#[test]
 fn changed_git_refresh_requests_headless_render() {
     let mut server = test_headless_server();
     let workspace = crate::workspace::Workspace::test_new("one");
@@ -4708,6 +4890,216 @@ async fn host_shutdown_preserves_panes_from_queued_and_selected_death_events() {
     assert!(server.handle_internal_event_with_forwarding(event()));
     assert!(server.app.find_pane(pane_id).is_none());
     shutdown_test_runtimes(&mut server);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _runtime = runtime.enter();
+    thread_local! {
+        static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn shutdown_after_api_entry() -> bool {
+        PROBES.with(|probes| {
+            let count = probes.get();
+            probes.set(count + 1);
+            count > 0
+        })
+    }
+    let _guard = crate::config::test_config_env_lock().lock().unwrap();
+    struct RestoreEnv([(&'static str, Option<std::ffi::OsString>); 2]);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, previous) in &self.0 {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let _env = RestoreEnv(
+        ["XDG_CONFIG_HOME", crate::session::SESSION_ENV_VAR]
+            .map(|key| (key, std::env::var_os(key))),
+    );
+    let config_home = std::env::temp_dir().join(format!(
+        "herdr-shutdown-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    std::env::remove_var(crate::session::SESSION_ENV_VAR);
+
+    for entry in [
+        "queued-death",
+        "selected-death",
+        "agent-exit",
+        "autosave",
+        "api-drain",
+    ] {
+        let mut server = test_headless_server();
+        server.app.policy.persist_session = true;
+        let workspace = crate::workspace::Workspace::test_new("shutdown");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.respawn_shell_on_exit = true;
+        terminal.set_agent_name("codex".into());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("previous-session").unwrap(),
+        });
+        server.app.save_session_now();
+        // Leave both the extra pane and new resume identity unsaved. The real
+        // server loop must write them rather than merely retain the old file.
+        let other_pane =
+            server.app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        server.app.state.ensure_test_terminals();
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("shutdown-session").unwrap(),
+            });
+        server.host_shutdown_probe = || true;
+        let death = || AppEvent::PaneDied {
+            pane_id,
+            exit_reason: crate::platform::classify_child_exit(
+                &portable_pty::ExitStatus::with_exit_code(0x40010004),
+            ),
+        };
+        let agent_exit = || AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Codex),
+            state: crate::detect::AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: Instant::now(),
+        };
+        match entry {
+            "queued-death" => {
+                server.app.event_tx.try_send(death()).unwrap();
+                assert_eq!(
+                    server.drain_internal_events_with_forwarding_up_to(16),
+                    (false, false)
+                );
+                assert!(server.app.event_rx.try_recv().is_ok());
+            }
+            "selected-death" => assert!(!server.handle_internal_event_with_forwarding(death())),
+            "agent-exit" => assert!(!server.handle_internal_event_with_forwarding(agent_exit())),
+            "autosave" => {
+                server.app.session_save_deadline = Some(Instant::now());
+                assert!(!server.handle_scheduled_tasks_headless(Instant::now(), false));
+            }
+            "api-drain" => {
+                PROBES.with(|probes| probes.set(0));
+                server.host_shutdown_probe = shutdown_after_api_entry;
+                server.app.event_tx.try_send(death()).unwrap();
+                let (respond_to, response_rx) = std::sync::mpsc::channel();
+                server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    request: api::schema::Request {
+                        id: "shutdown-race".into(),
+                        method: api::schema::Method::WorkspaceRename(
+                            api::schema::WorkspaceRenameParams {
+                                workspace_id: server.app.public_workspace_id(0),
+                                label: "must-not-be-saved".into(),
+                            },
+                        ),
+                    },
+                    respond_to,
+                    response_write_complete: None,
+                });
+                let response: api::schema::ErrorResponse =
+                    serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
+                assert_eq!(response.error.code, "server_unavailable");
+            }
+            _ => unreachable!(),
+        }
+        // Latch the warning: later process exits and due autosaves must not
+        // erase resume identity or layout, even if the native probe changes.
+        server.host_shutdown_probe = || false;
+        assert!(!server.handle_internal_event_with_forwarding(agent_exit()));
+        assert!(!server.handle_internal_event_with_forwarding(death()));
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id: other_pane,
+                exit_reason: crate::platform::classify_child_exit(
+                    &portable_pty::ExitStatus::with_exit_code(0xC0000142),
+                ),
+            })
+        );
+        assert!(server.should_quit.load(Ordering::Acquire));
+        assert_eq!(
+            server.app.terminal_runtimes.len(),
+            0,
+            "shutdown must not respawn a shell"
+        );
+        server.app.session_save_deadline = Some(Instant::now());
+        assert!(
+            !server.handle_scheduled_tasks_headless(Instant::now() + Duration::from_secs(6), false)
+        );
+        assert!(server.app.session_save_thread.is_none());
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), server.run())
+                .await
+                .expect("host shutdown must stop the isolated server loop")
+                .expect("server loop shuts down cleanly");
+        });
+        let snapshot = crate::persist::load().expect("shutdown session should be saved");
+        let panes = &snapshot.workspaces[0].tabs[0].panes;
+        assert_eq!(panes.len(), 2);
+        assert_eq!(
+            snapshot.workspaces[0].custom_name.as_deref(),
+            Some("shutdown")
+        );
+        assert_eq!(
+            panes[&pane_id.raw()].agent_session.as_ref().unwrap().value,
+            "shutdown-session"
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    // The same code outside host shutdown must not stop unrelated panes.
+    for code in [0x40010004, 0xC0000142] {
+        let mut server = test_headless_server();
+        server.host_shutdown_probe = || false;
+        let mut workspace = crate::workspace::Workspace::test_new("ordinary-exit");
+        let pane_id = workspace.tabs[0].root_pane;
+        let other_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id,
+                exit_reason: crate::platform::classify_child_exit(
+                    &portable_pty::ExitStatus::with_exit_code(code)
+                ),
+            })
+        );
+        assert!(server.app.find_pane(pane_id).is_none());
+        assert!(server.app.find_pane(other_pane).is_some());
+        assert!(!server.should_quit.load(Ordering::Acquire));
+        shutdown_test_runtimes(&mut server);
+    }
+
+    std::fs::remove_dir_all(config_home).unwrap();
 }
 
 #[tokio::test]
@@ -5091,6 +5483,43 @@ fn client_pane_pixel_mouse_uses_runtime_pixel_encoding() {
     assert_eq!(
         input_rx.try_recv().expect("encoded pixel mouse"),
         Bytes::from_static(b"\x1b[<35;21;22M")
+    );
+    drop(runtime);
+    drop(_runtime_guard);
+    rt.shutdown_timeout(Duration::from_millis(100));
+}
+
+#[test]
+fn client_pane_cell_mouse_uses_pixel_units_when_sgr_pixels_is_set() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let _runtime_guard = rt.enter();
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            20,
+            5,
+            0,
+            b"\x1b[?1003h\x1b[?1006h\x1b[?1016h",
+            4,
+        );
+    runtime.resize(5, 20, 10, 20);
+
+    apply_client_pane_input_events(
+        &runtime,
+        &[crate::protocol::ClientPaneInputEvent::Mouse {
+            kind: crate::protocol::ClientMouseKind::Moved,
+            position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+            geometry: None,
+            modifiers: 0,
+            lines: 3,
+        }],
+    )
+    .expect("cell-aligned pixel mouse input");
+    assert_eq!(
+        input_rx.try_recv().expect("encoded pixel-unit mouse"),
+        Bytes::from_static(b"\x1b[<35;25;30M")
     );
     drop(runtime);
     drop(_runtime_guard);
@@ -5998,6 +6427,75 @@ async fn client_shell_release_cleanup_does_not_promote_and_survives_disconnect()
     shutdown_test_runtimes(&mut server);
 }
 
+// Pixel mouse is a Unix client capability.
+#[cfg(unix)]
+#[tokio::test]
+async fn client_shell_requests_host_pixels_for_an_unfocused_pixel_pane() {
+    // #4750: host reports go to the pane under the pointer, focused or not.
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("pixel-split");
+    let first = workspace.tabs[0].root_pane;
+    let second = workspace.test_split(ratatui::layout::Direction::Horizontal);
+    let focused = workspace.focused_pane_id().expect("focused pane");
+    let unfocused = if focused == first { second } else { first };
+    workspace.insert_test_runtime(
+        focused,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(40, 23, b"plain"),
+    );
+    workspace.insert_test_runtime(
+        unfocused,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(
+            40,
+            23,
+            b"\x1b[?1003h\x1b[?1006h\x1b[?1016h",
+        ),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let (writer, control_rx, _render_rx) = test_client_writer();
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
+            client_id: 7,
+            surface_cols: 80,
+            surface_rows: 23,
+            cell_width_px: 10,
+            cell_height_px: 20,
+            pixel_mouse: true,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: true,
+            surface_active: true,
+            writer,
+        })
+    );
+
+    // Control messages arrive asynchronously; wait for the mode instead of
+    // reading the channel once.
+    let mut mouse_modes = Vec::new();
+    for _ in 0..20 {
+        server.stream_host_mouse_capture_mode();
+        while let Ok(bytes) = control_rx.recv_timeout(Duration::from_millis(50)) {
+            if let ServerMessage::MouseCapture {
+                enabled,
+                sgr_pixels,
+            } = read_server_message(bytes)
+            {
+                mouse_modes.push((enabled, sgr_pixels));
+            }
+        }
+        if mouse_modes.last() == Some(&(true, true)) {
+            break;
+        }
+    }
+    assert_eq!(mouse_modes.last(), Some(&(true, true)), "{mouse_modes:?}");
+    shutdown_test_runtimes(&mut server);
+}
+
 #[test]
 fn client_shell_mouse_capture_combines_local_preference_with_endpoint_demand() {
     let mut server = test_headless_server();
@@ -6183,11 +6681,12 @@ fn direct_terminal_streams_child_keyboard_and_mouse_modes() {
             read_server_message(
                 client_control_rx
                     .recv_timeout(Duration::from_millis(100))
-                    .expect("modifyOtherKeys mode-one keyboard message")
+                    .expect("kitty flags change with modifyOtherKeys mode one")
             ),
+            // Like Ghostty, modifyOtherKeys level 1 is not a negotiated mode.
             ServerMessage::DirectTerminalKeyboardProtocol {
                 flags: 3,
-                modify_other_keys_level: 1
+                modify_other_keys_level: 0
             }
         ));
 
@@ -6315,6 +6814,52 @@ fn direct_terminal_mouse_uses_runtime_protocol_encoding() {
             input_rx.try_recv().expect("encoded direct mouse input"),
             Bytes::from_static(b"\x1b[<0;11;6M")
         );
+    });
+}
+
+#[test]
+fn direct_terminal_mouse_sends_nothing_without_mouse_reporting() {
+    with_terminal_session_test_server(|server, runtime_terminal_id, terminal_id, _pane_id| {
+        // A plain shell never enabled mouse reporting, so a controller's click
+        // must not reach it as stray escape bytes.
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 4,
+            );
+        server
+            .app
+            .terminal_runtimes
+            .insert(runtime_terminal_id, runtime);
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::TerminalAttach {
+                    terminal_id: terminal_id.clone(),
+                },
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                1,
+                RenderEncoding::TerminalAnsi,
+                None,
+            ),
+        );
+
+        for kind in [
+            protocol::ClientMouseKind::Down(protocol::ClientMouseButton::Left),
+            protocol::ClientMouseKind::Drag(protocol::ClientMouseButton::Left),
+            protocol::ClientMouseKind::Up(protocol::ClientMouseButton::Left),
+            protocol::ClientMouseKind::Moved,
+        ] {
+            server.handle_server_event(ServerEvent::ClientAttachMouse {
+                client_id: 1,
+                kind,
+                position: protocol::ClientMousePosition::Cell { column: 10, row: 5 },
+                geometry: None,
+                modifiers: 0,
+                lines: 1,
+            });
+        }
+        assert!(input_rx.try_recv().is_err());
     });
 }
 
@@ -6997,7 +7542,6 @@ fn notification_show_api_forwards_one_semantic_client_notification() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);
@@ -7060,7 +7604,6 @@ fn notification_show_api_preserves_colon_in_forwarded_title() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);
@@ -7106,7 +7649,6 @@ fn notification_show_api_validates_empty_title_before_disabled_delivery() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);
@@ -7137,7 +7679,6 @@ fn notification_show_api_reports_no_foreground_client() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);
@@ -7188,7 +7729,6 @@ fn notification_show_api_includes_sound_in_semantic_event() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         })
     );
 
@@ -7250,12 +7790,147 @@ fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema:
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     let response = response_rx
         .recv_timeout(Duration::from_millis(100))
         .unwrap();
     serde_json::from_str::<api::schema::SuccessResponse>(&response).expect("successful report");
+}
+
+#[test]
+fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+        .attached_terminal_id
+        .clone();
+    let report = |resume_argv: Vec<&str>| {
+        api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+            pane_id: public_pane_id.clone(),
+            source: "prime-agent".into(),
+            agent: "prime-agent".into(),
+            state: api::schema::PaneAgentState::Idle,
+            message: None,
+            seq: Some(1),
+            agent_session_id: Some("01a0".into()),
+            agent_session_path: None,
+            resume_argv: Some(resume_argv.into_iter().map(String::from).collect()),
+        })
+    };
+
+    completion_guard_api_report(
+        &mut server,
+        report(vec!["prime-agent", "--resume", "01a0", "--model", "x"]),
+    );
+    assert_eq!(
+        server.app.state.terminals[&terminal_id]
+            .reported_resume()
+            .unwrap()
+            .argv,
+        vec!["prime-agent", "--resume", "01a0", "--model", "x"]
+    );
+
+    completion_guard_api_report(&mut server, report(vec!["prime-agent", "--resume", "dup"]));
+    assert_eq!(
+        server.app.state.terminals[&terminal_id]
+            .reported_resume()
+            .unwrap()
+            .argv[2],
+        "01a0",
+        "a duplicate sequence number must not replace the command"
+    );
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "invalid-resume".into(),
+            method: report(vec!["/opt/prime/prime-agent", "--resume", "01a0"]),
+        },
+        respond_to,
+        response_write_complete: None,
+    });
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    assert!(response.contains("invalid_resume_argv"), "{response}");
+    assert_eq!(
+        server.app.state.terminals[&terminal_id]
+            .reported_resume()
+            .unwrap()
+            .argv[0],
+        "prime-agent"
+    );
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "not-owner".into(),
+            method: api::schema::Method::PaneReportAgentSession(
+                api::schema::PaneReportAgentSessionParams {
+                    pane_id: public_pane_id.clone(),
+                    source: "custom:intruder".into(),
+                    agent: "intruder".into(),
+                    seq: None,
+                    agent_session_id: None,
+                    agent_session_path: None,
+                    session_start_source: None,
+                    resume_argv: Some(vec!["intruder".into()]),
+                },
+            ),
+        },
+        respond_to,
+        response_write_complete: None,
+    });
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    assert!(response.contains("resume_not_accepted"), "{response}");
+    assert_eq!(
+        server.app.state.terminals[&terminal_id]
+            .reported_resume()
+            .unwrap()
+            .agent,
+        "prime-agent"
+    );
+}
+
+#[test]
+fn api_resume_argv_is_ignored_when_its_session_report_is_refused() {
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+        .attached_terminal_id
+        .clone();
+    server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+        pane_id,
+        agent: crate::detect::Agent::Claude,
+        observed_at: Instant::now(),
+    });
+    let report = |session: &str| {
+        api::schema::Method::PaneReportAgentSession(api::schema::PaneReportAgentSessionParams {
+            pane_id: public_pane_id.clone(),
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            seq: None,
+            agent_session_id: Some(session.into()),
+            agent_session_path: None,
+            session_start_source: None,
+            resume_argv: Some(vec!["claude".into(), "--resume".into(), session.into()]),
+        })
+    };
+
+    completion_guard_api_report(&mut server, report("session-a"));
+    completion_guard_api_report(&mut server, report("session-b"));
+
+    let terminal = &server.app.state.terminals[&terminal_id];
+    assert!(terminal
+        .session_ref_is_current(&crate::agent_resume::AgentSessionRef::id("session-a").unwrap()));
+    assert_eq!(
+        terminal.reported_resume().unwrap().argv,
+        vec!["claude", "--resume", "session-a"]
+    );
 }
 
 fn completion_guard_notifications(
@@ -7316,6 +7991,7 @@ fn completion_guard_api_startup_blocker_respects_suppression() {
                 seq: Some(seq as u64 + 1),
                 agent_session_id: None,
                 agent_session_path: None,
+                resume_argv: None,
             }),
         );
     }
@@ -7379,6 +8055,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                     seq: Some(11),
                     agent_session_id: None,
                     agent_session_path: Some(new_session.clone()),
+                    resume_argv: None,
                     session_start_source: Some(reason.into()),
                 }),
             );
@@ -7391,6 +8068,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 seq: Some(12),
                 agent_session_id: None,
                 agent_session_path: Some(new_session.clone()),
+                resume_argv: None,
             };
             completion_guard_api_report(&mut server, Method::PaneReportAgent(report.clone()));
             let terminal = &server.app.state.terminals[&terminal_id];
@@ -7581,11 +8259,11 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                 seq: Some(19),
                 agent_session_id: None,
                 agent_session_path: None,
+                resume_argv: None,
             }),
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);

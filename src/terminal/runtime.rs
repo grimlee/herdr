@@ -249,6 +249,10 @@ impl TerminalRuntime {
         self.0.set_full_lifecycle_authority_active(active);
     }
 
+    pub fn set_self_reported_agent_active(&self, active: bool) {
+        self.0.set_self_reported_agent_active(active);
+    }
+
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
@@ -454,6 +458,10 @@ impl TerminalRuntime {
         self.0.kitty_image_placements_with_data_filter(needs_data)
     }
 
+    pub(crate) fn kitty_image_fingerprints(&self, image_ids: &[u32]) -> Vec<Option<u64>> {
+        self.0.kitty_image_fingerprints(image_ids)
+    }
+
     pub fn keyboard_protocol(&self) -> crate::input::KeyboardProtocol {
         self.0.keyboard_protocol()
     }
@@ -468,6 +476,10 @@ impl TerminalRuntime {
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_bytes(bytes)
+    }
+
+    pub(crate) fn validate_input_submission(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.validate_input_submission(bytes)
     }
 
     pub fn queue_user_input_submission(
@@ -593,6 +605,25 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    #[cfg(unix)]
+    pub(crate) fn test_start_basic_detection(&mut self) -> mpsc::Receiver<crate::events::AppEvent> {
+        self.0.test_start_basic_detection()
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn test_wait_for_detection_reads(&self, expected: usize) {
+        self.0.test_wait_for_detection_reads(expected).await;
+    }
+
+    pub(crate) fn test_scroll_metrics_reads(&self) -> usize {
+        self.0.test_scroll_metrics_reads()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn test_enable_kitty_source_forwarding(&self) {
+        self.0.test_enable_kitty_source_forwarding();
+    }
+
     pub(crate) fn test_contend_during_dirty_collection(
         &self,
         bytes: Vec<u8>,
@@ -603,6 +634,11 @@ impl TerminalRuntime {
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel(cols, rows);
         (Self(runtime), rx)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn test_with_actor(actor: crate::pty::actor::PtyIoActorHandle) -> Self {
+        Self(crate::pane::PaneRuntime::test_with_actor(actor))
     }
 
     pub(crate) fn test_with_channel_capacity(

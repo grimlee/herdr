@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -118,6 +118,8 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 窗格控制方法使用 `w1:p1` 这类公开窗格 id。schema 中 `pane_id` 可选的方法,在省略它时使用服务器当前聚焦的活动窗格。`pane.move` 总是要求来源 `pane_id`。
 
 `pane.send_keys` 和 `pane.send_input.keys` 接受 Herdr 组合键字符串: 普通可打印键、`enter` 和 `esc` 这类特殊键、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` 这类修饰组合键、`f1` 这类功能键,以及 `minus` 和 `plus` 这类命名标点。它们不接受 `prefix+` 绑定字符串。
+
+在 macOS 上,`pane.send_input`（由 `pane run` 使用）和 `agent.start` 会在命令进入输入队列前,检查终端当前规范模式的输入长度限制。编码后的行（包括 Enter）超限时,整条输入会被拒绝;请等待 shell 提示符出现后重试。多条短行和原始模式输入仍受支持。成功响应仍只表示已接受入队,不表示命令已执行。检查仅覆盖本次提交:它无法检查此前尚未完成的输入行,也无法保证排队期间终端模式不会改变。
 
 ```json
 {"id":"req_current","method":"pane.current","params":{"caller_pane_id":"w1:p1"}}
@@ -147,20 +149,9 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 
 ### 窗格图形
 
-窗格图形允许插件在窗格上放置图像数据。该功能默认可用；当服务器设置 `[terminal].kitty_graphics = false` 时，所有窗格图形方法都返回 `feature_disabled`。更改此设置需要重启服务器。调用 `pane.graphics.info` 会返回所连接客户端的单元格像素宽度和高度,但不会创建图形层。`pane.graphics.set` 接受 `data_base64` 中的 `png`、`rgb` 或 `rgba` 数据,`pane.graphics.clear` 删除该图层。
+应用和插件应通过窗格的终端输出发送标准 Kitty 图形协议。Herdr 在兼容的外层终端中管理图像的位置、裁剪和可见性。
 
-```json
-{"id":"graphics_info","method":"pane.graphics.info","params":{"pane_id":"w1:p1"}}
-{"id":"graphics_set","method":"pane.graphics.set","params":{"pane_id":"w1:p1","format":"png","image_width":800,"image_height":600,"data_base64":"...","placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}}
-{"id":"graphics_clear","method":"pane.graphics.clear","params":{"pane_id":"w1:p1"}}
-```
-
-要重复发送帧,用 `pane.graphics.stream` 打开专用 socket。Herdr 回复 `ok` 后,每一帧发送一个 JSON 头,再发送恰好 `data_length` 字节的原始数据。socket 关闭前,该流拥有对应窗格的图形层;并发 set、clear 或 stream 请求返回 `stream_conflict`。
-
-```json
-{"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1"}}
-{"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
-```
+外部 socket 窗格图像叠加 API 已移除:`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear` 和 `pane.graphics.stream` 不再可用,也没有替代的 socket 图像 API。与旧服务器的内部传输协议兼容性不会恢复这些公开方法。
 
 `pane.layout` 返回标签页布局快照,包含 `workspace_id`、`tab_id`、`zoomed`、外层 `area`、`focused_pane_id`、窗格矩形和分割矩形/比例。`pane.neighbor` 和 `pane.edges` 也包含同一份布局快照,让客户端不需要私有布局状态就能做出下一步决策。
 
@@ -493,6 +484,8 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
 {"id":"req_1","result":{"type":"pong"}}
 ```
 
+对于已进入 JSON 解码的请求行,错误响应也会回显请求的 `id`,包括方法或参数无效的情况。如果 JSON 无效或顶层没有明确的字符串 `id`,错误响应会使用空 `id`。无效 UTF-8 等传输错误可能直接关闭连接而不返回响应。
+
 事件订阅在初始响应之后保持连接打开。
 
 ## Socket 路径
@@ -548,6 +541,22 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
     "source": "herdr:codex",
     "agent": "codex",
     "agent_session_id": "..."
+  }
+}
+```
+
+两个方法都接受可选的 `resume_argv` 数组,内容是 Herdr 服务器重启后恢复上报者当前会话的命令。第一个元素必须是普通命令名而不是路径。该数组最多允许 64 个元素,总大小不超过 8 KiB,并且任何元素都不能包含撇号或控制字符;无效值会以 `invalid_resume_argv` 失败,该次上报不会生效。自定义智能体必须先通过 `pane.report_agent` 持有窗格才能附加命令,否则请求会以 `resume_not_accepted` 失败。Herdr 只在同一 `source` 和 `agent` 持有窗格时保留该命令,并且它优先于 Herdr 为该智能体内置的恢复命令。旧版 Herdr 会忽略这个字段。
+
+```json
+{
+  "id": "req_3",
+  "method": "pane.report_agent_session",
+  "params": {
+    "pane_id": "w1:p1",
+    "source": "custom:my-agent",
+    "agent": "my-agent",
+    "agent_session_id": "...",
+    "resume_argv": ["my-agent", "--resume", "..."]
   }
 }
 ```
@@ -633,7 +642,7 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 }
 ```
 
-第一个响应确认订阅。之后的行是推送的事件。生命周期事件订阅从请求被接受时开始,不会重放在此之前保留的事件。
+第一个响应确认订阅。之后的行是推送的事件。所有条目都必须有效:如果引用的任何窗格不存在,Herdr 会拒绝整个请求,返回错误并关闭连接。请刷新窗格列表后重试,不要假定其他条目已经订阅。生命周期事件订阅从请求被接受时开始,不会重放在此之前保留的事件。
 
 生命周期和智能体状态事件按有界批次发送,每个订阅内保持事件顺序。事件历史不是持久日志。如果订阅者落后到保留范围之外,包括订阅初始化期间,服务器会发送包含原请求 `id` 和 `error.code: "events_lost"` 的错误响应,然后关闭该订阅连接,而不是静默跳过缺失事件后继续发送。其他客户端的连接不受影响。各类事件共享历史缓冲,因此即使被淘汰的事件可能不匹配此订阅的过滤条件,仍会报告溢出。
 

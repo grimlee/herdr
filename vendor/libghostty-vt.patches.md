@@ -170,3 +170,105 @@ just test-one clear_pane
 just maintenance-test
 just check
 ```
+
+## 0007 experimental encoded PNG and immutable source retention
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0007-experimental-png-retention.patch`
+
+herdr issue: none; maintainer-directed native Kitty forwarding experiment
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
+
+local files:
+
+- `vendor/libghostty-vt/include/ghostty/vt/terminal.h`
+- `vendor/libghostty-vt/include/ghostty/vt/kitty_graphics.h`
+- `vendor/libghostty-vt/src/terminal/c/terminal.zig`
+- `vendor/libghostty-vt/src/terminal/c/kitty_graphics.zig`
+- `vendor/libghostty-vt/src/terminal/kitty/graphics_image.zig`
+- `vendor/libghostty-vt/src/terminal/kitty/graphics_exec.zig`
+- `vendor/libghostty-vt/src/terminal/kitty/graphics_storage.zig`
+
+reason: An explicitly enabled embedding mode retains structurally validated,
+quiet PNG uploads as encoded bytes, avoiding pixel decoding before forwarding
+through a multiplexer. The existing raw getters retain their meaning; separate
+getters expose retained PNG bytes. Queries and response-bearing uploads retain
+full validation, and animation operations materialize pixels transactionally.
+Storage reserves both encoded bytes and expected decoded size.
+
+This is default-off and experimental: CRC-valid corrupt compressed pixels may
+be rejected later than in normal mode, including after placement. Quiet mode
+suppresses replies, not validation semantics; this patch is not a claim of full
+protocol-equivalent transparent forwarding. Herdr exercises this mode only in
+tests; production PNG uploads retain full decoding and validation.
+
+A separate default-off snapshot callback retains host-owned immutable raw RGBA
+file backing before reading pixels. Herdr installs this callback automatically
+on Linux, using same-filesystem CoW snapshots. It never retains a mutable producer pathname. Unsupported snapshots
+use the original loader; animation materializes pixels transactionally. Backing
+ownership and bounded reads are explicit in the embedding ABI.
+
+remove when: upstream provides an equivalent opt-in owned encoded-image
+representation and immutable host-backed raw sources with bounded storage,
+strict query handling and lazy pixel materialization, or this experiment is retired.
+
+verification:
+
+```sh
+just test-one native_source
+just test-one png_forward_tests
+just test-one kitty_png_replacement
+just test-one kitty_file_image_survives
+(cd vendor/libghostty-vt && zig build test-lib-vt -Dtest-filter='experimental PNG')
+just check
+```
+
+## 0008 keep cursor hyperlink across page replacement
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0008-cursor-hyperlink-page-replace.patch`
+
+herdr issue: https://github.com/herdrdev/herdr/issues/5296
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
+
+local files:
+
+- `vendor/libghostty-vt/src/terminal/Screen.zig`
+
+reason: Moving the cursor onto another page while a hyperlink and a
+non-default style are active can grow that page. Growth replaces the page,
+re-adds the same heap hyperlink, and frees it. The outer move then clears
+the pointer without clearing the id that replacement just installed, so
+`endHyperlink` dereferences null and the server dies. The same sequence is
+still present on upstream main (`cursorChangePin` around line 1606 and
+`cursorPageReplaced` around line 706 at 22fa134a0). This is not the one-row
+scrollback prune fixed by 65ff54c67.
+
+The same function also crashes when style migration hits the maximum style
+capacity: the page split moves the cursor again, and the nested pin change
+releases hyperlink id 0 from a page that no longer holds it. The patch skips
+that release when an outer pin change already released the link.
+
+remove when: the vendored source keeps the cursor hyperlink alive across a
+page replacement or page split during a pin change, and both Screen tests
+below pass without this patch.
+
+verification:
+
+```sh
+(cd vendor/libghostty-vt && zig build test-lib-vt -Dtest-filter='cursorAbsolute across a full page keeps the hyperlink')
+(cd vendor/libghostty-vt && zig build test-lib-vt -Dtest-filter='cursorAbsolute keeps the hyperlink when style migration splits the page')
+just maintenance-test
+```

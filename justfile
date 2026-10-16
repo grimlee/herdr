@@ -19,7 +19,7 @@ maintenance-test:
 # Local interactive Windows Terminal input qualification (never runs in normal CI).
 [windows]
 test-windows-input *args:
-    pwsh -NoProfile -File scripts/test_windows_input.ps1 -AllowInputInjection {{args}}
+    pwsh -NoProfile -File scripts/test_windows_input.ps1 -AllowInputInjection -ClearClipboard {{args}}
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
@@ -80,12 +80,38 @@ install-hooks:
     @echo "installed git hooks from .githooks"
 
 # Build release binary
+[unix]
 build:
     cargo build --release --locked
+
+[windows]
+build:
+    python scripts/package_windows_conpty.py build-local
 
 # Non-gating full-render scaling profile for background workspaces and active panes
 bench-render-scale:
     cargo test --release --locked --bin herdr render_scale_profile -- --ignored --nocapture --test-threads=1
+
+# Profile terminal target name resolution at increasing pane counts.
+bench-terminal-targets:
+    cargo test --release --locked --bin herdr terminal_target_lookup_profile -- --ignored --nocapture --test-threads=1
+
+# Profile Windows foreground inspection of isolated idle shells, without a server.
+[windows]
+bench-process-inspection:
+    cargo test --release --locked --bin herdr windows_process_inspection_profile -- --ignored --nocapture --test-threads=1
+
+# Profile BSP split collection and construction with balanced and skewed trees.
+bench-bsp-layout:
+    cargo test --release --locked --bin herdr bsp_layout_profile -- --ignored --nocapture --test-threads=1
+
+# Profile full and retained text, static-image, and unchanged-image updates.
+bench-retained-graphics:
+    cargo test --release --locked --bin herdr render_scale_profile_retained_graphics -- --ignored --nocapture --test-threads=1
+
+# Profile first-batch latency and aggregate drain cost for external API bursts.
+bench-api-fairness:
+    cargo test --release --locked --bin herdr external_api_burst_profile -- --ignored --nocapture --test-threads=1
 
 # ~3-5 minute CPU comparison; downloads stable unless HERDR_PERF_BASELINE_BIN is set
 bench-release-smoke:

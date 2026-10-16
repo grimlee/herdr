@@ -50,7 +50,7 @@ impl SpawnedHerdr {
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
-        let _ = self.child.kill();
+        support::stop_spawned_herdr(&mut *self.child);
         self.close_master();
 
         if let Some(pid) = pid {
@@ -125,6 +125,7 @@ fn spawn_client_process_with_args_and_env(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    support::isolate_herdr_test_process(&mut cmd);
     cmd.args(args);
     cmd.env("HERDR_DISABLE_SOUND", "1");
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
@@ -185,6 +186,7 @@ fn spawn_server_with_config(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    support::isolate_herdr_test_process(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -435,6 +437,7 @@ fn client_sees_headless_startup_config_diagnostic() {
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    support::isolate_herdr_test_process(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
@@ -714,6 +717,73 @@ fn read_output(output: &SharedOutput) -> String {
         .clone()
 }
 
+#[test]
+fn sigwinch_refreshes_host_palette_without_resizing() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let server = spawn_server_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        "onboarding = false\n[theme]\nname = \"terminal\"\n",
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let client = spawn_client_shell_process(&config_home, &runtime_dir, &api_socket);
+    let master = client._master.as_ref().expect("client PTY");
+    let output = spawn_pty_drain(master.try_clone_reader().unwrap());
+    let mut writer = master.take_writer().unwrap();
+    let queries = "\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+            read_output(&output).contains(queries)
+        }),
+        "client should query the initial palette: {:?}",
+        read_output(&output)
+    );
+
+    // Complete the startup query with a light palette. No appearance notification
+    // is sent: this models a terminal whose colors are changed directly by OSC.
+    let mut light =
+        String::from("\x1b]10;rgb:0000/0000/0000\x1b\\\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+    for index in 0..=u8::MAX {
+        light.push_str(&format!("\x1b]4;{index};rgb:ffff/ffff/ffff\x1b\\"));
+    }
+    writer.write_all(light.as_bytes()).unwrap();
+    writer.flush().unwrap();
+    // Let startup settle and the resize watcher install its signal handler.
+    thread::sleep(Duration::from_millis(250));
+
+    for _ in 0..2 {
+        let watermark = output_len(&output);
+        assert_eq!(
+            unsafe { libc::kill(client.child.process_id().unwrap() as i32, libc::SIGWINCH) },
+            0
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                let captured = read_output(&output);
+                let refreshed = &captured[watermark..];
+                refreshed.contains(queries) && refreshed.contains("\x1b]4;15;?\x1b\\")
+            }),
+            "SIGWINCH should query default colors and the ANSI palette without changing PTY size"
+        );
+        writer
+            .write_all(b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\\x1b]11;rgb:1111/2222/3333\x1b\\")
+            .unwrap();
+        writer.flush().unwrap();
+    }
+
+    drop(writer);
+    drop(client);
+    cleanup_spawned_herdr(server, base);
+}
+
 /// Current captured byte length, used as a watermark so a test can search only
 /// the output emitted *after* a trigger. The teardown markers also appear in
 /// normal attach-phase output, so matching the whole buffer is meaningless.
@@ -914,6 +984,13 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
     }
 }
 
+/// CI runners are heavily loaded, and a saved remote can need several connection
+/// attempts plus activation retries (each activation phase has its own deadline)
+/// before it is usable. These budgets only slow the failure path: every
+/// `wait_until` below returns as soon as its condition holds.
+const REMOTE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_INPUT_TIMEOUT: Duration = Duration::from_secs(20);
+
 #[test]
 fn federated_client_starts_without_local_and_survives_its_restart() {
     use std::os::unix::fs::PermissionsExt;
@@ -971,7 +1048,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
     let ssh_commands = base.join("ssh-commands");
     let bridge_pid = base.join("bridge-pid");
     fs::write(bin.join("ssh"), format!(
-        "#!/bin/sh\nexport HOME={} XDG_CONFIG_HOME={} XDG_RUNTIME_DIR={} HERDR_SOCKET_PATH={}\nunset HERDR_CLIENT_SOCKET_PATH HERDR_SESSION\nfor arg do last=\"$arg\"; done\nprintf '%s\\n' \"$last\" >> {}\ncase \"$last\" in *remote-client-bridge*) printf '%s\\n' \"$$\" > {};; esac\nexec /bin/sh -c \"$last\"\n",
+        "#!/bin/sh\nexport HOME={} XDG_CONFIG_HOME={} XDG_RUNTIME_DIR={} HERDR_SOCKET_PATH={}\nunset HERDR_CLIENT_SOCKET_PATH HERDR_SESSION\ncontrol=; previous=; configuration=\nfor arg do\n  if [ \"$previous\" = -S ]; then control=$arg; fi\n  if [ \"$arg\" = -G ]; then configuration=yes; fi\n  previous=$arg; last=$arg\ndone\nif [ -n \"$configuration\" ]; then printf 'controlpath %s\\n' \"$control\"; exit 0; fi\nprintf '%s\\n' \"$last\" >> {}\ncase \"$last\" in *remote-client-bridge*) printf '%s\\n' \"$$\" > {};; esac\nexec /bin/sh -c \"$last\"\n",
         quote(&base.join("home")), quote(&remote_config), quote(&remote_runtime), quote(&remote_api), quote(&ssh_commands), quote(&bridge_pid),
     )).unwrap();
     fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -997,7 +1074,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         terminal_screen::text(&bytes, 80, 24)
     };
     assert!(
-        wait_until(Duration::from_secs(12), Duration::from_millis(20), || {
+        wait_until(REMOTE_READY_TIMEOUT, Duration::from_millis(20), || {
             screen_text().contains("REMOTE_INITIAL_FRAME")
         }),
         "remote must be usable before Local exists: {}",
@@ -1028,7 +1105,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
             "remote reconnect {cycle} must restore the visible screen without switching machines"
         );
         assert!(
-            wait_until(Duration::from_secs(8), Duration::from_millis(100), || {
+            wait_until(REMOTE_INPUT_TIMEOUT, Duration::from_millis(100), || {
                 if screen_text().contains(&format!("REMOTE_ALIVE_INPUT_{cycle}")) {
                     return true;
                 }
@@ -1060,11 +1137,11 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         || screen_text().contains("local-online")
     ));
 
-    local.child.kill().unwrap();
+    support::stop_spawned_herdr(&mut *local.child);
     local.close_master();
     drop(local);
     assert!(
-        wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
+        wait_until(REMOTE_INPUT_TIMEOUT, Duration::from_millis(20), || {
             if screen_text().contains("REMOTE_SURVIVED") {
                 return true;
             }
@@ -1158,7 +1235,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
     ));
 
     let watermark = output_len(&output);
-    remote_server.child.kill().unwrap();
+    support::stop_spawned_herdr(&mut *remote_server.child);
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
             read_output(&output)[watermark..].contains("reconnecting")
@@ -1190,7 +1267,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
     );
     // A coherent frame precedes the final host-effects fence; input stays gated until then.
     assert!(
-        wait_until(Duration::from_secs(8), Duration::from_millis(100), || {
+        wait_until(REMOTE_INPUT_TIMEOUT, Duration::from_millis(100), || {
             if screen_text().contains("LOCAL_INPUT_RECOVERED") {
                 return true;
             }
@@ -2001,6 +2078,7 @@ fn client_receives_notify_on_agent_state_change() {
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    support::isolate_herdr_test_process(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);

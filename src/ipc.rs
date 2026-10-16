@@ -47,7 +47,48 @@ pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
 
         let name = path.to_string_lossy().to_string();
         let name = name.to_ns_name::<GenericNamespaced>()?;
-        LocalStream::connect(name)
+        LocalStream::connect(name).map_err(crate::platform::local_server_connection_error)
+    }
+}
+
+pub(crate) fn connect_local_stream_cancellable(
+    path: &Path,
+    stopped: &std::sync::atomic::AtomicBool,
+    deadline: std::time::Instant,
+) -> io::Result<LocalStream> {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    loop {
+        if stopped.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection attempt cancelled",
+            ));
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "endpoint connection timed out")
+            })?;
+        let timeout = remaining.min(Duration::from_millis(100));
+        #[cfg(unix)]
+        let result = {
+            use interprocess::local_socket::{ConnectOptions, GenericFilePath, ToFsName as _};
+            ConnectOptions::new()
+                .name(path.to_fs_name::<GenericFilePath>()?)
+                .wait_mode(interprocess::ConnectWaitMode::Timeout(timeout))
+                .connect_sync()
+        };
+        #[cfg(windows)]
+        let result = crate::platform::connect_local_stream_with_timeout(path, timeout);
+        match result {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            result => return result,
+        }
     }
 }
 
@@ -66,12 +107,14 @@ pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(windows)]
     {
         use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
 
         let name = path.to_string_lossy().to_string();
         let name = name.to_ns_name::<GenericNamespaced>()?;
         let listener = ListenerOptions::new()
             .name(name)
             .reclaim_name(false)
+            .security_descriptor(crate::platform::local_server_security_descriptor()?)
             .create_sync()?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)

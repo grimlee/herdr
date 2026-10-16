@@ -132,6 +132,24 @@ impl ClientWriter {
         self.render.queue.discard_pending_render();
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_paused() -> Self {
+        let queue = ClientWriterQueue::new();
+        Self {
+            control: ClientControlWriter::queue(queue.clone()),
+            render: ClientRenderWriter::queue(queue),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_drain(&self) -> Vec<Vec<u8>> {
+        let mut state = self.render.queue.lock_state();
+        let mut frames = state.control.drain(..).collect::<Vec<_>>();
+        frames.extend(state.ordered.drain(..));
+        frames.extend(state.render.take());
+        frames
+    }
+
     #[cfg(test)]
     pub(crate) fn test_fill_render(&self, data: Vec<u8>) {
         self.render.try_send(data).unwrap();
@@ -400,6 +418,7 @@ pub(crate) enum ServerEvent {
         surface_active: bool,
         surface_reuse: bool,
         surface_delta: bool,
+        surface_scroll: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -767,6 +786,7 @@ pub(crate) fn handle_client_handshake(
                     hello.surface_active,
                     hello.surface_reuse,
                     hello.surface_delta,
+                    hello.surface_scroll,
                 )),
             )
         }
@@ -844,9 +864,9 @@ pub(crate) fn handle_client_handshake(
     // Spawn a writer thread that forwards messages from the channels to the stream.
     let write_stream = stream.try_clone()?;
     let writer_event_tx = server_event_tx.clone();
-    std::thread::spawn(move || {
+    crate::thread_spawn::spawn_named("herdr-client-writer", move || {
         client_writer_loop(write_stream, client_id, writer_queue, writer_event_tx);
-    });
+    })?;
 
     if should_quit.load(Ordering::Acquire) {
         send_shutdown_to_unregistered_client(&writer);
@@ -863,6 +883,7 @@ pub(crate) fn handle_client_handshake(
         surface_active,
         surface_reuse,
         surface_delta,
+        surface_scroll,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -878,6 +899,7 @@ pub(crate) fn handle_client_handshake(
             surface_active,
             surface_reuse,
             surface_delta,
+            surface_scroll,
             writer,
         }
     } else {
@@ -1454,6 +1476,7 @@ mod tests {
             surface_active: true,
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             snapshot_codecs: vec![crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
@@ -1678,29 +1701,62 @@ mod tests {
         ));
     }
 
+    /// Keeps both kernel socket buffers far below the frame size so the writer must
+    /// block for the observer instead of accepting the whole frame at once. Without
+    /// this the reset path would only be exercised when the platform default buffers
+    /// happen to be smaller than the frame.
+    #[cfg(unix)]
+    fn limit_local_stream_buffers(stream: &LocalStream) {
+        use std::os::fd::AsRawFd as _;
+
+        let LocalStream::UdSocket(socket) = stream;
+        let bytes: libc::c_int = 64 * 1024;
+        for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            let result = unsafe {
+                libc::setsockopt(
+                    socket.inner().as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    std::ptr::addr_of!(bytes).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(result, 0, "setsockopt({option}) failed");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn observer_write_timeout_resets_when_sending_makes_progress() {
         use std::io::Read as _;
 
+        // A slow observer that keeps draining must not be disconnected, because every
+        // partial write resets the writer's deadline. Keep the drain cadence far below
+        // the write timeout so a loaded runner's scheduler jitter cannot manufacture a
+        // stall, while the transfer still outlasts the timeout so the reset is required
+        // (otherwise the writer could finish within one timeout window without resetting).
+        const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+        const DRAIN_INTERVAL: Duration = Duration::from_millis(25);
+        const TOTAL_BYTES: usize = 1024 * 1024;
+
         let (mut client, mut server, _path) = local_stream_pair("slow-observer");
-        server
-            .set_send_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
+        limit_local_stream_buffers(&server);
+        limit_local_stream_buffers(&client);
+        server.set_send_timeout(Some(WRITE_TIMEOUT)).unwrap();
         server.set_nonblocking(true).unwrap();
         let worker = std::thread::spawn(move || {
-            assert!(write_framed_bytes(&mut server, &vec![b'x'; 1024 * 1024]));
+            assert!(write_framed_bytes(&mut server, &vec![b'x'; TOTAL_BYTES]));
         });
         client
-            .set_recv_timeout(Some(Duration::from_secs(3)))
+            .set_recv_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let mut received = 0;
         let mut buffer = [0; 16 * 1024];
-        while received < 1024 * 1024 {
+        while received < TOTAL_BYTES {
             let count = client.read(&mut buffer).unwrap();
             assert_ne!(count, 0, "observer disconnected while making progress");
             received += count;
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(DRAIN_INTERVAL);
         }
         worker.join().unwrap();
     }
@@ -1971,10 +2027,12 @@ mod tests {
                 surface_active,
                 surface_reuse,
                 surface_delta,
+                surface_scroll,
                 writer,
             } => {
                 assert!(!surface_reuse);
                 assert!(!surface_delta);
+                assert!(!surface_scroll);
                 assert_eq!(client_id, 43);
                 assert_eq!((surface_cols, surface_rows), (80, 29));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
@@ -1994,6 +2052,80 @@ mod tests {
             .join()
             .expect("handshake thread join")
             .expect("handshake thread result");
+    }
+
+    #[test]
+    fn endpoint_health_waits_for_registration_but_not_the_initial_snapshot() {
+        let (mut client, server, _path) = local_stream_pair("startup-health");
+        let (events, mut pending) = mpsc::channel(1);
+        events
+            .blocking_send(ServerEvent::ClientWriterDrained { client_id: 99 })
+            .unwrap();
+        let server_events = events.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_client_handshake(
+                server,
+                43,
+                &server_events,
+                &Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let mut reader = client.try_clone().unwrap();
+        let (messages, received) = std::sync::mpsc::channel();
+        let client_thread = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let message: ServerMessage =
+                    protocol::read_message(&mut reader, MAX_FRAME_SIZE).unwrap();
+                messages.send(message).unwrap();
+            }
+        });
+        protocol::write_message(&mut client, &endpoint_hello(80, 29)).unwrap();
+        let welcome = endpoint_welcome(received.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(welcome.error.is_none());
+        let ping = ClientMessage::EndpointControl {
+            kind: crate::protocol::endpoint::HEALTH_PING_KIND.into(),
+            data: "startup".into(),
+        };
+        protocol::write_message(&mut client, &ping).unwrap();
+        assert!(matches!(
+            received.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            pending.blocking_recv(),
+            Some(ServerEvent::ClientWriterDrained { client_id: 99 })
+        ));
+        let Some(ServerEvent::ClientShellConnected { writer, .. }) = pending.blocking_recv() else {
+            panic!("registration must precede other client events");
+        };
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::endpoint::HEALTH_PONG_KIND
+        ));
+
+        // Registered transports answer health checks while the state loop is still busy.
+        events
+            .blocking_send(ServerEvent::ClientWriterDrained { client_id: 99 })
+            .unwrap();
+        protocol::write_message(&mut client, &ping).unwrap();
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::endpoint::HEALTH_PONG_KIND
+        ));
+        protocol::write_message(&mut client, &ClientMessage::Detach).unwrap();
+        assert!(matches!(
+            pending.blocking_recv(),
+            Some(ServerEvent::ClientWriterDrained { client_id: 99 })
+        ));
+        assert!(matches!(
+            pending.blocking_recv(),
+            Some(ServerEvent::ClientDetach { client_id: 43 })
+        ));
+        server_thread.join().unwrap().unwrap();
+        client_thread.join().unwrap();
+        drop(writer);
     }
 
     #[test]
